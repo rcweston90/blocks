@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Isometric Grid Block Editor</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="toolbar">
+    <div id="toolbar-buttons">
+      <button data-tool="addBlock" class="active">Add Blocks</button>
+      <button data-tool="drawRect">Draw Rectangle</button>
+      <button data-tool="select">Select</button>
+      <button data-tool="moveCamera">Move Camera</button>
+      <span class="toolbar-separator"></span>
+      <label class="toolbar-color-group">
+        <span class="toolbar-label">Color</span>
+        <input type="color" id="color-picker" value="#98a8b8">
+      </label>
+      <button id="btn-download">Download JSON</button>
+      <button id="btn-upload">Upload JSON</button>
+    </div>
+    <div id="status">Ready.</div>
+    <input type="file" id="file-input" accept=".json" hidden>
+  </div>
+  <canvas id="canvas"></canvas>
+  <script src="app.js"></script>
+</body>
+</html>

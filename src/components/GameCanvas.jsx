@@ -3,22 +3,32 @@ import { AppState } from '../engine/state.js';
 import { ToolManager } from '../engine/tools.js';
 import { FPSTracker } from '../engine/fps.js';
 import { Renderer } from '../engine/renderer.js';
+import { FirstPersonRenderer } from '../engine/firstPersonRenderer.js';
 import { BikeState, DIRECTIONS, SPEED_LABELS } from '../engine/bike.js';
-import { screenToGrid } from '../engine/math.js';
-
+import { generateMap } from '../engine/mapGenerator.js';
+import { screenToGrid, rotateDirection } from '../engine/math.js';
+import { THEMES, getNextTheme } from '../engine/themes.js';
 const GameCanvas = forwardRef(function GameCanvas({
   mode,
   activeTool,
   activeColor,
+  activeFloorType,
+  activeTheme,
   bikeSpeed,
   isPaused,
+  isFirstPerson,
   onStatusChange,
   onColorSync,
   onToolChange,
   onSpeedChange,
   onPauseChange,
   onCameraFollowChange,
+  onThemeChange,
+  onFirstPersonToggle,
   isCameraFollow,
+  worldBoundary,
+  activeRampDir,
+  onRampDirChange,
 }, ref) {
   const canvasRef = useRef(null);
   const engineRef = useRef(null);
@@ -51,8 +61,13 @@ const GameCanvas = forwardRef(function GameCanvas({
     resetBike() {
       const engine = engineRef.current;
       if (!engine || !engine.bike) return;
-      engine.bike.reset();
+      engine.bike.reset(engine.state.getStartBlock());
       engine.state.statusText = 'Bike reset';
+    },
+    generate(layoutId) {
+      const engine = engineRef.current;
+      if (!engine) return;
+      generateMap(engine.state, layoutId);
     },
   }), []);
 
@@ -64,8 +79,9 @@ const GameCanvas = forwardRef(function GameCanvas({
     const toolManager = new ToolManager();
     const fpsTracker = new FPSTracker();
     const renderer = new Renderer(canvas, state, fpsTracker);
+    const fpRenderer = new FirstPersonRenderer(canvas, state, fpsTracker);
 
-    engineRef.current = { state, toolManager, fpsTracker, renderer, ctx, bike: null };
+    engineRef.current = { state, toolManager, fpsTracker, renderer, fpRenderer, ctx, bike: null, isFirstPerson: false };
 
     // Resize handler
     const resize = () => {
@@ -94,7 +110,11 @@ const GameCanvas = forwardRef(function GameCanvas({
         engine.bike.tick(now, state);
       }
 
-      renderer.frame(now);
+      if (engine.isFirstPerson && engine.bike) {
+        fpRenderer.frame(now);
+      } else {
+        renderer.frame(now);
+      }
 
       // Push status text changes up to React
       if (state.statusText !== lastStatusText) {
@@ -115,7 +135,7 @@ const GameCanvas = forwardRef(function GameCanvas({
     };
     rafId = requestAnimationFrame(loop);
 
-    // Mouse helpers -- account for zoom
+    // Mouse helpers
     const getCanvasPos = (e) => {
       const rect = canvas.getBoundingClientRect();
       return { x: e.clientX - rect.left, y: e.clientY - rect.top };
@@ -127,6 +147,7 @@ const GameCanvas = forwardRef(function GameCanvas({
       return screenToGrid(pos.x / zoom, pos.y / zoom, {
         x: state.camera.x / zoom,
         y: state.camera.y / zoom,
+        rotation: state.camera.rotation,
       });
     };
 
@@ -167,7 +188,6 @@ const GameCanvas = forwardRef(function GameCanvas({
       const newZoom = Math.max(0.5, Math.min(2.0, zoom + delta));
       if (newZoom === zoom) return;
 
-      // Zoom toward mouse position
       const pos = getCanvasPos(e);
       const factor = newZoom / zoom;
       state.camera.x = pos.x - (pos.x - state.camera.x) * factor;
@@ -201,8 +221,12 @@ const GameCanvas = forwardRef(function GameCanvas({
 
     if (mode === 'drive') {
       const bike = new BikeState();
+      const startBlock = state.getStartBlock();
+      if (startBlock) bike.reset(startBlock);
       engine.bike = bike;
       renderer.bike = bike;
+      engine.fpRenderer.bike = bike;
+      engine.fpRenderer.theme = renderer.theme;
       state.activeTool = 'moveCamera';
       state.selection = null;
       state.dragState = null;
@@ -211,6 +235,7 @@ const GameCanvas = forwardRef(function GameCanvas({
     } else {
       engine.bike = null;
       renderer.bike = null;
+      engine.fpRenderer.bike = null;
       state.statusText = 'Ready.';
     }
   }, [mode]);
@@ -245,17 +270,33 @@ const GameCanvas = forwardRef(function GameCanvas({
     const { state } = engine;
     state.activeColor = activeColor;
 
-    // Update selected block color in edit mode
     if (state.selection && state.selection.type === 'block') {
       const block = state.blocks[state.selection.index];
       if (block) block.color = activeColor;
     }
 
-    // Sync trail color in drive mode
     if (engine.bike) {
       engine.bike.trailColor = activeColor;
     }
   }, [activeColor]);
+
+  // Sync active floor type
+  useEffect(() => {
+    const engine = engineRef.current;
+    if (!engine) return;
+    engine.state.activeFloorType = activeFloorType || 'boost';
+  }, [activeFloorType]);
+
+  // Sync theme
+  useEffect(() => {
+    const engine = engineRef.current;
+    if (!engine) return;
+    const theme = THEMES[activeTheme];
+    if (theme) {
+      engine.renderer.theme = theme;
+      engine.fpRenderer.theme = theme;
+    }
+  }, [activeTheme]);
 
   // Sync bike speed from toolbar
   useEffect(() => {
@@ -278,6 +319,55 @@ const GameCanvas = forwardRef(function GameCanvas({
     engine.bike.cameraFollow = isCameraFollow;
   }, [isCameraFollow]);
 
+  // Sync world boundary from toolbar
+  useEffect(() => {
+    const engine = engineRef.current;
+    if (!engine) return;
+    engine.state.worldBoundary = worldBoundary ?? 40;
+  }, [worldBoundary]);
+
+  // Sync active ramp direction
+  useEffect(() => {
+    const engine = engineRef.current;
+    if (!engine) return;
+    engine.state.activeRampDir = activeRampDir ?? 0;
+  }, [activeRampDir]);
+
+  // Sync first-person mode
+  useEffect(() => {
+    const engine = engineRef.current;
+    if (!engine) return;
+    engine.isFirstPerson = isFirstPerson;
+  }, [isFirstPerson]);
+
+  // Camera rotation (Q/E) — always active in all modes
+  useEffect(() => {
+    const handler = (e) => {
+      const engine = engineRef.current;
+      if (!engine) return;
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
+      if (e.metaKey || e.ctrlKey) return;
+
+      if (engine.isFirstPerson) return; // Q/E not applicable in FP mode
+      const { state } = engine;
+      if (e.key === 'q' || e.key === 'Q') {
+        e.preventDefault();
+        const cam = state.camera;
+        cam.rotationIndex = (cam.rotationIndex + 3) % 4;
+        cam.targetRotation -= Math.PI / 2;
+        state.statusText = `Rotate left (${cam.rotationIndex * 90}°)`;
+      } else if (e.key === 'e' || e.key === 'E') {
+        e.preventDefault();
+        const cam = state.camera;
+        cam.rotationIndex = (cam.rotationIndex + 1) % 4;
+        cam.targetRotation += Math.PI / 2;
+        state.statusText = `Rotate right (${cam.rotationIndex * 90}°)`;
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, []);
+
   // Edit-mode keyboard shortcuts
   useEffect(() => {
     if (mode !== 'edit') return;
@@ -287,13 +377,11 @@ const GameCanvas = forwardRef(function GameCanvas({
       if (!engine) return;
       const { state, toolManager } = engine;
 
-      // Don't capture if user is in an input
-      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
 
       const key = e.key;
       const isCmd = e.metaKey || e.ctrlKey;
 
-      // Undo: Cmd+Z
       if (isCmd && !e.shiftKey && key === 'z') {
         e.preventDefault();
         if (state.undo()) {
@@ -302,7 +390,6 @@ const GameCanvas = forwardRef(function GameCanvas({
         return;
       }
 
-      // Redo: Cmd+Shift+Z or Ctrl+Y
       if ((isCmd && e.shiftKey && key === 'z') || (isCmd && key === 'y')) {
         e.preventDefault();
         if (state.redo()) {
@@ -311,16 +398,16 @@ const GameCanvas = forwardRef(function GameCanvas({
         return;
       }
 
-      // Don't process tool shortcuts if modifier is held
       if (isCmd) return;
 
-      // Tool switching
       const toolMap = {
-        b: 'addBlock', B: 'addBlock',
+        b: 'addWall', B: 'addWall',
+        g: 'paintFloor', G: 'paintFloor',
+        n: 'placeCoin', N: 'placeCoin',
         r: 'drawRect', R: 'drawRect',
         s: 'select', S: 'select',
         v: 'moveCamera', V: 'moveCamera',
-        e: 'eraser', E: 'eraser',
+        x: 'eraser', X: 'eraser',
         f: 'fill', F: 'fill',
       };
 
@@ -330,7 +417,6 @@ const GameCanvas = forwardRef(function GameCanvas({
         return;
       }
 
-      // Escape -- deselect + clear drag
       if (key === 'Escape') {
         state.selection = null;
         state.dragState = null;
@@ -338,7 +424,6 @@ const GameCanvas = forwardRef(function GameCanvas({
         return;
       }
 
-      // Delete / Backspace -- delete selected
       if (key === 'Delete' || key === 'Backspace') {
         const sel = state.selection;
         if (!sel) return;
@@ -354,16 +439,17 @@ const GameCanvas = forwardRef(function GameCanvas({
         return;
       }
 
-      // T -- toggle neon theme (works in edit mode too)
+      // T -- cycle theme
       if (key === 't' || key === 'T') {
         e.preventDefault();
         const { renderer } = engine;
-        renderer.neonTheme = !renderer.neonTheme;
-        state.statusText = `Neon theme: ${renderer.neonTheme ? 'ON' : 'OFF'}`;
+        const nextTheme = getNextTheme(renderer.theme.id);
+        renderer.theme = nextTheme;
+        if (onThemeChange) onThemeChange(nextTheme.id);
+        state.statusText = `Theme: ${nextTheme.label}`;
         return;
       }
 
-      // Height adjustment: ] raise, [ lower
       if (key === ']') {
         const selectTool = toolManager.get('select');
         selectTool.adjustHeight(state, 1);
@@ -374,11 +460,24 @@ const GameCanvas = forwardRef(function GameCanvas({
         selectTool.adjustHeight(state, -1);
         return;
       }
+
+      // D — cycle ramp direction when floor tool + ramp type active
+      if (key === 'd' || key === 'D') {
+        if (state.activeTool === 'paintFloor' && state.activeFloorType === 'ramp') {
+          e.preventDefault();
+          const next = ((state.activeRampDir || 0) + 1) % 4;
+          state.activeRampDir = next;
+          const labels = ['N', 'E', 'S', 'W'];
+          state.statusText = `Ramp direction: ${labels[next]}`;
+          if (onRampDirChange) onRampDirChange(next);
+          return;
+        }
+      }
     };
 
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [mode, onToolChange]);
+  }, [mode, onToolChange, onThemeChange, onRampDirChange]);
 
   // Drive-mode keyboard handler
   useEffect(() => {
@@ -389,24 +488,42 @@ const GameCanvas = forwardRef(function GameCanvas({
       if (!engine || !engine.bike) return;
       const bike = engine.bike;
 
-      // Don't capture if user is in an input
-      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
 
-      // Direction keys (arrow + WASD)
+      // F: toggle first-person view
+      if (e.key === 'f' || e.key === 'F') {
+        e.preventDefault();
+        if (onFirstPersonToggle) onFirstPersonToggle();
+        return;
+      }
+
       const dir = DIRECTIONS[e.key];
       if (dir) {
         e.preventDefault();
-        if (!bike.alive) {
-          bike.reset();
+        if (!bike.alive || bike.levelComplete) {
+          bike.reset(engine.state.getStartBlock());
           engine.state.statusText = 'Drive mode -- use arrow keys or WASD!';
           if (onPauseChange) onPauseChange(false);
+        } else if (engine.isFirstPerson) {
+          // FP mode: left/right = relative turn, up/down = no-op
+          const isLeft = e.key === 'ArrowLeft' || e.key === 'a' || e.key === 'A';
+          const isRight = e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D';
+          if (isLeft) {
+            const d = bike.direction;
+            bike.setDirection({ dgx: d.dgy, dgy: -d.dgx });
+          } else if (isRight) {
+            const d = bike.direction;
+            bike.setDirection({ dgx: -d.dgy, dgy: d.dgx });
+          }
+          // Up/Down: no-op (bike auto-moves forward)
         } else {
-          bike.setDirection(dir);
+          // Rotate direction so arrow keys stay screen-relative
+          const rotated = rotateDirection(dir.dgx, dir.dgy, engine.state.camera.rotationIndex);
+          bike.setDirection(rotated);
         }
         return;
       }
 
-      // Speed presets: 1-5
       if (e.key >= '1' && e.key <= '5') {
         e.preventDefault();
         const idx = parseInt(e.key) - 1;
@@ -416,7 +533,6 @@ const GameCanvas = forwardRef(function GameCanvas({
         return;
       }
 
-      // Speed increment/decrement: +/-
       if (e.key === '+' || e.key === '=') {
         e.preventDefault();
         const newIdx = Math.min(4, bike.speedIndex + 1);
@@ -434,7 +550,6 @@ const GameCanvas = forwardRef(function GameCanvas({
         return;
       }
 
-      // Space -- toggle pause
       if (e.key === ' ') {
         e.preventDefault();
         bike.togglePause();
@@ -443,23 +558,20 @@ const GameCanvas = forwardRef(function GameCanvas({
         return;
       }
 
-      // R -- reset
       if (e.key === 'r' || e.key === 'R') {
         e.preventDefault();
-        bike.reset();
+        bike.reset(engine.state.getStartBlock());
         engine.state.statusText = 'Bike reset';
         if (onPauseChange) onPauseChange(false);
         if (onSpeedChange) onSpeedChange(bike.speedIndex);
         return;
       }
 
-      // Shift -- boost (keydown)
       if (e.key === 'Shift') {
         bike.boosting = true;
         return;
       }
 
-      // C -- toggle camera follow
       if (e.key === 'c' || e.key === 'C') {
         e.preventDefault();
         bike.toggleCameraFollow();
@@ -468,7 +580,6 @@ const GameCanvas = forwardRef(function GameCanvas({
         return;
       }
 
-      // G -- toggle ghost trail
       if (e.key === 'g' || e.key === 'G') {
         e.preventDefault();
         bike.toggleGhostTrail();
@@ -476,7 +587,6 @@ const GameCanvas = forwardRef(function GameCanvas({
         return;
       }
 
-      // I -- toggle invincibility
       if (e.key === 'i' || e.key === 'I') {
         e.preventDefault();
         bike.toggleInvincible();
@@ -484,11 +594,15 @@ const GameCanvas = forwardRef(function GameCanvas({
         return;
       }
 
-      // T -- toggle neon theme
+      // T -- cycle theme
       if (e.key === 't' || e.key === 'T') {
         e.preventDefault();
-        engine.renderer.neonTheme = !engine.renderer.neonTheme;
-        engine.state.statusText = `Neon theme: ${engine.renderer.neonTheme ? 'ON' : 'OFF'}`;
+        const { renderer, fpRenderer } = engine;
+        const nextTheme = getNextTheme(renderer.theme.id);
+        renderer.theme = nextTheme;
+        fpRenderer.theme = nextTheme;
+        if (onThemeChange) onThemeChange(nextTheme.id);
+        engine.state.statusText = `Theme: ${nextTheme.label}`;
         return;
       }
     };
@@ -497,7 +611,6 @@ const GameCanvas = forwardRef(function GameCanvas({
       const engine = engineRef.current;
       if (!engine || !engine.bike) return;
 
-      // Shift release -- stop boost
       if (e.key === 'Shift') {
         engine.bike.boosting = false;
       }
@@ -509,7 +622,7 @@ const GameCanvas = forwardRef(function GameCanvas({
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
     };
-  }, [mode, onSpeedChange, onPauseChange, onCameraFollowChange]);
+  }, [mode, onSpeedChange, onPauseChange, onCameraFollowChange, onThemeChange, onFirstPersonToggle]);
 
   return <canvas ref={canvasRef} id="canvas" />;
 });

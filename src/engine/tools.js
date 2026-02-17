@@ -1,9 +1,59 @@
-export class AddBlockTool {
+import { getBlockType } from './blockTypes.js';
+
+export class AddWallTool {
   onMouseDown(state, cell) {
     state.pushUndo();
     const newZ = state.getMaxZ(cell.gx, cell.gy) + 1;
-    state.addBlock(cell.gx, cell.gy, newZ, state.activeColor);
-    state.statusText = `Placed block at (${cell.gx}, ${cell.gy}, z=${newZ})`;
+    state.addBlock(cell.gx, cell.gy, newZ, state.activeColor, 'normal');
+    state.lastPlacementMode = 'wall';
+    state.statusText = `Placed wall at (${cell.gx}, ${cell.gy}, z=${newZ})`;
+  }
+  onMouseMove() {}
+  onMouseUp() {}
+}
+
+export class PaintFloorTool {
+  onMouseDown(state, cell) {
+    const floorType = state.activeFloorType || 'boost';
+
+    // If placing a ramp and top block is already a ramp, rotate it instead
+    if (floorType === 'ramp') {
+      const topIdx = state.getTopmostBlockIndex(cell.gx, cell.gy);
+      if (topIdx !== -1) {
+        const topBlock = state.blocks[topIdx];
+        if (topBlock.type === 'ramp') {
+          state.pushUndo();
+          topBlock.dir = ((topBlock.dir || 0) + 1) % 4;
+          const labels = ['N', 'E', 'S', 'W'];
+          state.statusText = `Rotated ramp to ${labels[topBlock.dir]} at (${cell.gx}, ${cell.gy})`;
+          state._rebuildBlockMap();
+          return;
+        }
+      }
+    }
+
+    state.pushUndo();
+    if (floorType === 'start') {
+      state.removeStartBlocks();
+    }
+    const bt = getBlockType(floorType);
+    const newZ = state.getMaxZ(cell.gx, cell.gy) + 1;
+    const dir = (floorType === 'ramp' || floorType === 'start') ? (state.activeRampDir || 0) : 0;
+    state.addBlock(cell.gx, cell.gy, newZ, bt.defaultColor, floorType, dir);
+    state.lastPlacementMode = 'floor';
+    state.statusText = `Painted ${bt.label} floor at (${cell.gx}, ${cell.gy}, z=${newZ})`;
+  }
+  onMouseMove() {}
+  onMouseUp() {}
+}
+
+export class PlaceCoinTool {
+  onMouseDown(state, cell) {
+    state.pushUndo();
+    const bt = getBlockType('coin');
+    const newZ = state.getMaxZ(cell.gx, cell.gy) + 1;
+    state.addBlock(cell.gx, cell.gy, newZ, bt.defaultColor, 'coin');
+    state.statusText = `Placed coin at (${cell.gx}, ${cell.gy}, z=${newZ})`;
   }
   onMouseMove() {}
   onMouseUp() {}
@@ -204,14 +254,22 @@ export class FillTool {
       const x2 = Math.max(a.gx, cell.gx);
       const y2 = Math.max(a.gy, cell.gy);
       let count = 0;
+
+      const isFloor = state.lastPlacementMode === 'floor';
+      const fillType = isFloor ? (state.activeFloorType || 'boost') : 'normal';
+      const bt = getBlockType(fillType);
+      const fillColor = isFloor ? bt.defaultColor : state.activeColor;
+
+      const dir = (isFloor && fillType === 'ramp') ? (state.activeRampDir || 0) : 0;
       for (let gx = x1; gx <= x2; gx++) {
         for (let gy = y1; gy <= y2; gy++) {
           const newZ = state.getMaxZ(gx, gy) + 1;
-          state.addBlock(gx, gy, newZ, state.activeColor);
+          state.addBlock(gx, gy, newZ, fillColor, fillType, dir);
           count++;
         }
       }
-      state.statusText = `Filled ${count} blocks (${x1},${y1}) -> (${x2},${y2})`;
+      const label = isFloor ? bt.label + ' floor' : 'wall';
+      state.statusText = `Filled ${count} ${label} blocks (${x1},${y1}) -> (${x2},${y2})`;
       state.dragState = null;
     }
   }
@@ -220,7 +278,9 @@ export class FillTool {
 export class ToolManager {
   constructor() {
     this.tools = {
-      addBlock: new AddBlockTool(),
+      addWall: new AddWallTool(),
+      paintFloor: new PaintFloorTool(),
+      placeCoin: new PlaceCoinTool(),
       drawRect: new DrawRectTool(),
       select: new SelectTool(),
       moveCamera: new MoveCameraTool(),

@@ -22,6 +22,11 @@ export class FirstPersonRenderer {
     // Crash tracking
     this._crashDetected = false;
     this._crashFlashStart = 0;
+
+    // HUD visibility toggles
+    this.showFPS = true;
+    this.showMetrics = true;
+    this.showMinimap = true;
   }
 
   frame(now) {
@@ -75,9 +80,9 @@ export class FirstPersonRenderer {
 
     // HUD (screen-space, unaffected by shake)
     this._drawCrashEffects(ctx, w, h, now);
-    this._drawFPS(ctx);
-    this._drawMetrics(ctx, w, h, now);
-    this._drawMiniMap(ctx, w, h, posX, posY);
+    if (this.showFPS) this._drawFPS(ctx);
+    if (this.showMetrics) this._drawMetrics(ctx, w, h, now);
+    if (this.showMinimap) this._drawMiniMap(ctx, w, h, posX, posY);
     this._drawScanlines(ctx, w, h);
   }
 
@@ -618,33 +623,42 @@ export class FirstPersonRenderer {
 
   _drawMiniMap(ctx, w, h, posX, posY) {
     const dpr = window.devicePixelRatio || 1;
-    const canvasH = this.canvas.height / dpr;
+    const vpW = this.canvas.width / dpr;
+    const vpH = this.canvas.height / dpr;
     const boundary = this.state.worldBoundary || DEFAULT_BOUNDARY;
-    const mapSize = 120;
-    const padding = 10;
-    const x = padding;
-    const y = canvasH - mapSize - padding;
 
-    // Background panel
+    // Size as ~18% of viewport's shorter dimension
+    const mapSize = Math.round(Math.min(vpW, vpH) * 0.18);
+    const pad = Math.round(mapSize * 0.08);
+    const radius = Math.round(mapSize * 0.06);
+    const x = pad;
+    const y = vpH - mapSize - pad;
+
+    // Proportional drawing units
+    const lineW = Math.max(1, mapSize * 0.012);
+    const dotR = Math.max(1, mapSize * 0.012);
+    const bikeR = Math.max(2, mapSize * 0.035);
+
+    // Background
     ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
     ctx.beginPath();
-    ctx.roundRect(x, y, mapSize, mapSize, 4);
+    ctx.roundRect(x, y, mapSize, mapSize, radius);
     ctx.fill();
-
     if (this.theme.hudBorder) {
       ctx.strokeStyle = this.theme.hudBorder;
-      ctx.lineWidth = 1;
+      ctx.lineWidth = lineW;
       ctx.stroke();
     }
 
     ctx.save();
     ctx.beginPath();
-    ctx.roundRect(x, y, mapSize, mapSize, 4);
+    ctx.roundRect(x, y, mapSize, mapSize, radius);
     ctx.clip();
 
+    const margin = mapSize * 0.08;
     const mapCx = x + mapSize / 2;
     const mapCy = y + mapSize / 2;
-    const scale = (mapSize - 10) / (boundary * 2);
+    const scale = (mapSize - margin * 2) / (boundary * 2);
 
     const toMap = (gx, gy) => ({
       x: mapCx + gx * scale,
@@ -653,7 +667,7 @@ export class FirstPersonRenderer {
 
     // Boundary border
     ctx.strokeStyle = 'rgba(255, 80, 80, 0.6)';
-    ctx.lineWidth = 1;
+    ctx.lineWidth = lineW;
     ctx.strokeRect(
       mapCx - boundary * scale,
       mapCy - boundary * scale,
@@ -665,13 +679,13 @@ export class FirstPersonRenderer {
     for (const block of this.state.blocks) {
       const mp = toMap(block.gx, block.gy);
       ctx.fillStyle = block.color || '#98a8b8';
-      ctx.fillRect(mp.x - 1, mp.y - 1, 2, 2);
+      ctx.fillRect(mp.x - dotR, mp.y - dotR, dotR * 2, dotR * 2);
     }
 
-    // Trail line
+    // Trail
     if (this.bike.trail.length > 0) {
       ctx.strokeStyle = this.bike.trailColor || '#00fff2';
-      ctx.lineWidth = 1;
+      ctx.lineWidth = lineW;
       ctx.globalAlpha = 0.7;
       ctx.beginPath();
       const firstT = toMap(this.bike.trail[0].gx, this.bike.trail[0].gy);
@@ -688,14 +702,14 @@ export class FirstPersonRenderer {
     const playerMap = toMap(posX - 0.5, posY - 0.5);
     ctx.fillStyle = '#fff';
     ctx.beginPath();
-    ctx.arc(playerMap.x, playerMap.y, 3, 0, Math.PI * 2);
+    ctx.arc(playerMap.x, playerMap.y, bikeR, 0, Math.PI * 2);
     ctx.fill();
 
     // Direction line
     const angle = this._cameraAngle;
-    const dirLen = 8;
+    const dirLen = mapSize * 0.12;
     ctx.strokeStyle = '#fff';
-    ctx.lineWidth = 1.5;
+    ctx.lineWidth = lineW * 1.5;
     ctx.beginPath();
     ctx.moveTo(playerMap.x, playerMap.y);
     ctx.lineTo(
@@ -705,10 +719,10 @@ export class FirstPersonRenderer {
     ctx.stroke();
 
     // FOV cone
-    const coneLen = 15;
+    const coneLen = mapSize * 0.2;
     const halfFov = this.FOV / 2;
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
-    ctx.lineWidth = 1;
+    ctx.lineWidth = lineW;
     ctx.beginPath();
     ctx.moveTo(playerMap.x, playerMap.y);
     ctx.lineTo(

@@ -18,6 +18,7 @@ const NAV_TOOLS = [
   { id: 'select', label: 'Select', shortcut: 'S' },
   { id: 'moveCamera', label: 'Pan', shortcut: 'V' },
   { id: 'eraser', label: 'Eraser', shortcut: 'X' },
+  { id: 'eyedropper', label: 'Pick', shortcut: 'I' },
 ];
 
 const SPEED_LABELS = ['Slow', 'Normal', 'Fast', 'Faster', 'Max'];
@@ -65,6 +66,7 @@ export default function Toolbar({
   onBoundaryChange,
   activeRampDir,
   onRampDirChange,
+  onHelpToggle,
 }) {
   const fileInputRef = useRef(null);
 
@@ -250,6 +252,15 @@ export default function Toolbar({
               </div>
             </div>
           )}
+
+          <button
+            className="toolbar-help-btn"
+            onClick={onHelpToggle}
+            title="Keyboard shortcuts (?)"
+            aria-label="Help"
+          >
+            ?
+          </button>
 
           {showColorPicker && (
             <div className="toolbar-edit-section toolbar-section">

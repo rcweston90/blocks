@@ -6,7 +6,7 @@ import { Renderer } from '../engine/renderer.js';
 import { FirstPersonRenderer } from '../engine/firstPersonRenderer.js';
 import { BikeState, DIRECTIONS, SPEED_LABELS } from '../engine/bike.js';
 import { generateMap } from '../engine/mapGenerator.js';
-import { screenToGrid, rotateDirection } from '../engine/math.js';
+import { screenToGrid, gridToScreen, rotateDirection } from '../engine/math.js';
 import { THEMES, getNextTheme } from '../engine/themes.js';
 const GameCanvas = forwardRef(function GameCanvas({
   mode,
@@ -27,13 +27,14 @@ const GameCanvas = forwardRef(function GameCanvas({
   onFirstPersonToggle,
   isCameraFollow,
   worldBoundary,
+  onBoundaryChange,
   activeRampDir,
   onRampDirChange,
 }, ref) {
   const canvasRef = useRef(null);
   const engineRef = useRef(null);
 
-  // Expose download/upload to parent via ref
+  // Expose download/upload/touch controls to parent via ref
   useImperativeHandle(ref, () => ({
     download() {
       const engine = engineRef.current;
@@ -68,6 +69,81 @@ const GameCanvas = forwardRef(function GameCanvas({
       const engine = engineRef.current;
       if (!engine) return;
       generateMap(engine.state, layoutId);
+
+      // Center camera on the generated content
+      const blocks = engine.state.blocks;
+      if (blocks.length > 0) {
+        let minGx = Infinity, maxGx = -Infinity, minGy = Infinity, maxGy = -Infinity;
+        for (const b of blocks) {
+          if (b.gx < minGx) minGx = b.gx;
+          if (b.gx > maxGx) maxGx = b.gx;
+          if (b.gy < minGy) minGy = b.gy;
+          if (b.gy > maxGy) maxGy = b.gy;
+        }
+        const centerGx = (minGx + maxGx) / 2;
+        const centerGy = (minGy + maxGy) / 2;
+        const cam = engine.state.camera;
+        const rot = cam.rotation || 0;
+        const zoom = cam.zoom || 1;
+        const dpr = window.devicePixelRatio || 1;
+        const canvas = canvasRef.current;
+        const vpW = canvas.width / dpr;
+        const vpH = canvas.height / dpr;
+        const center = gridToScreen(centerGx, centerGy, rot);
+        cam.x = vpW / 2 - center.x * zoom;
+        cam.y = vpH / 2 - center.y * zoom;
+      }
+
+      // Sync the map-set boundary back to React state
+      if (onBoundaryChange && engine.state.worldBoundary) {
+        onBoundaryChange(engine.state.worldBoundary);
+      }
+    },
+    steer(direction) {
+      const engine = engineRef.current;
+      if (!engine || !engine.bike) return;
+      const bike = engine.bike;
+      if (!bike.alive || bike.levelComplete) {
+        bike.reset(engine.state.getStartBlock());
+        engine.state.statusText = 'Drive mode -- use arrow keys or WASD!';
+        return;
+      }
+      if (engine.isFirstPerson) {
+        if (direction === 'left') {
+          const d = bike.direction;
+          bike.setDirection({ dgx: d.dgy, dgy: -d.dgx });
+        } else if (direction === 'right') {
+          const d = bike.direction;
+          bike.setDirection({ dgx: -d.dgy, dgy: d.dgx });
+        }
+      } else {
+        const dirMap = { up: { dgx: 0, dgy: -1 }, down: { dgx: 0, dgy: 1 }, left: { dgx: -1, dgy: 0 }, right: { dgx: 1, dgy: 0 } };
+        const dir = dirMap[direction];
+        if (dir) {
+          const rotated = rotateDirection(dir.dgx, dir.dgy, engine.state.camera.rotationIndex);
+          bike.setDirection(rotated);
+        }
+      }
+    },
+    jump() {
+      const engine = engineRef.current;
+      if (!engine || !engine.bike) return;
+      const bike = engine.bike;
+      if (bike.alive && !bike.paused && bike.cellsTraveled > 0 && !bike.jumping) {
+        bike.jumping = true;
+        bike.jumpStartTime = performance.now();
+        engine.state.statusText = 'JUMP!';
+      }
+    },
+    startBoost() {
+      const engine = engineRef.current;
+      if (!engine || !engine.bike) return;
+      engine.bike.boosting = true;
+    },
+    endBoost() {
+      const engine = engineRef.current;
+      if (!engine || !engine.bike) return;
+      engine.bike.boosting = false;
     },
   }), []);
 
@@ -80,6 +156,14 @@ const GameCanvas = forwardRef(function GameCanvas({
     const fpsTracker = new FPSTracker();
     const renderer = new Renderer(canvas, state, fpsTracker);
     const fpRenderer = new FirstPersonRenderer(canvas, state, fpsTracker);
+
+    // Wire eyedropper color callback
+    const eyedropperTool = toolManager.get('eyedropper');
+    if (eyedropperTool) {
+      eyedropperTool.onColorPicked = (color) => {
+        onColorSync(color);
+      };
+    }
 
     engineRef.current = { state, toolManager, fpsTracker, renderer, fpRenderer, ctx, bike: null, isFirstPerson: false };
 
@@ -152,6 +236,16 @@ const GameCanvas = forwardRef(function GameCanvas({
     };
 
     const onMouseDown = (e) => {
+      // Check if click is within minimap region first
+      const pos = getCanvasPos(e);
+      const engine = engineRef.current;
+      if (engine) {
+        const activeRenderer = engine.isFirstPerson ? engine.fpRenderer : engine.renderer;
+        if (activeRenderer.handleMinimapClick && activeRenderer.handleMinimapClick(pos.x, pos.y)) {
+          return; // Click was handled by minimap
+        }
+      }
+
       const cell = getCell(e);
       const tool = toolManager.get(state.activeTool);
       if (tool) tool.onMouseDown(state, cell, e);
@@ -398,6 +492,34 @@ const GameCanvas = forwardRef(function GameCanvas({
         return;
       }
 
+      // Copy/paste
+      if (isCmd && key === 'c') {
+        e.preventDefault();
+        const sel = state.selection;
+        if (sel && sel.type === 'block') {
+          const block = state.blocks[sel.index];
+          if (block) {
+            state.clipboard = { ...block };
+            state.statusText = 'Block copied';
+          }
+        }
+        return;
+      }
+
+      if (isCmd && key === 'v') {
+        e.preventDefault();
+        if (state.clipboard && state.hoverCell) {
+          state.pushUndo();
+          const cb = state.clipboard;
+          const gx = Math.round(state.hoverCell.gx);
+          const gy = Math.round(state.hoverCell.gy);
+          const newZ = state.getMaxZ(gx, gy) + 1;
+          state.addBlock(gx, gy, newZ, cb.color, cb.type || 'normal', cb.dir || 0);
+          state.statusText = `Pasted block at (${gx}, ${gy}, z=${newZ})`;
+        }
+        return;
+      }
+
       if (isCmd) return;
 
       const toolMap = {
@@ -409,6 +531,7 @@ const GameCanvas = forwardRef(function GameCanvas({
         v: 'moveCamera', V: 'moveCamera',
         x: 'eraser', X: 'eraser',
         f: 'fill', F: 'fill',
+        i: 'eyedropper', I: 'eyedropper',
       };
 
       if (toolMap[key]) {
@@ -552,9 +675,16 @@ const GameCanvas = forwardRef(function GameCanvas({
 
       if (e.key === ' ') {
         e.preventDefault();
-        bike.togglePause();
-        engine.state.statusText = bike.paused ? 'Paused' : 'Resumed';
-        if (onPauseChange) onPauseChange(bike.paused);
+        // Jump if alive and moving; otherwise toggle pause
+        if (bike.alive && !bike.paused && bike.cellsTraveled > 0 && !bike.jumping) {
+          bike.jumping = true;
+          bike.jumpStartTime = performance.now();
+          engine.state.statusText = 'JUMP!';
+        } else {
+          bike.togglePause();
+          engine.state.statusText = bike.paused ? 'Paused' : 'Resumed';
+          if (onPauseChange) onPauseChange(bike.paused);
+        }
         return;
       }
 
@@ -603,6 +733,40 @@ const GameCanvas = forwardRef(function GameCanvas({
         fpRenderer.theme = nextTheme;
         if (onThemeChange) onThemeChange(nextTheme.id);
         engine.state.statusText = `Theme: ${nextTheme.label}`;
+        return;
+      }
+
+      // M -- toggle minimap
+      if (e.key === 'm' || e.key === 'M') {
+        e.preventDefault();
+        const { renderer, fpRenderer } = engine;
+        const newVal = !renderer.showMinimap;
+        renderer.showMinimap = newVal;
+        fpRenderer.showMinimap = newVal;
+        engine.state.statusText = `Minimap: ${newVal ? 'ON' : 'OFF'}`;
+        return;
+      }
+
+      // H -- cycle HUD visibility: all on -> minimap only -> all off -> all on
+      if (e.key === 'h' || e.key === 'H') {
+        e.preventDefault();
+        const { renderer, fpRenderer } = engine;
+        if (renderer.showFPS && renderer.showMetrics && renderer.showMinimap) {
+          // All on -> minimap only
+          renderer.showFPS = false; renderer.showMetrics = false; renderer.showMinimap = true;
+          fpRenderer.showFPS = false; fpRenderer.showMetrics = false; fpRenderer.showMinimap = true;
+          engine.state.statusText = 'HUD: minimap only';
+        } else if (!renderer.showFPS && !renderer.showMetrics && renderer.showMinimap) {
+          // Minimap only -> all off
+          renderer.showFPS = false; renderer.showMetrics = false; renderer.showMinimap = false;
+          fpRenderer.showFPS = false; fpRenderer.showMetrics = false; fpRenderer.showMinimap = false;
+          engine.state.statusText = 'HUD: all hidden';
+        } else {
+          // All off (or any other state) -> all on
+          renderer.showFPS = true; renderer.showMetrics = true; renderer.showMinimap = true;
+          fpRenderer.showFPS = true; fpRenderer.showMetrics = true; fpRenderer.showMinimap = true;
+          engine.state.statusText = 'HUD: all visible';
+        }
         return;
       }
     };

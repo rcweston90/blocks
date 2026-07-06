@@ -27,6 +27,19 @@ export class Renderer {
     // Boost zoom tracking
     this._wasBoosted = false;
     this._boostZoom = 1.0;
+
+    // Cached depth sort
+    this._sortedBlocks = [];
+    this._sortedRotation = null;
+    this._sortedDirtyKey = null;
+
+    // Camera easing
+    this._lastFrameTime = 0;
+
+    // HUD visibility toggles
+    this.showFPS = true;
+    this.showMetrics = true;
+    this.showMinimap = true;
   }
 
   clear() {
@@ -248,6 +261,48 @@ export class Renderer {
     const stroke = theme.blockStroke;
     const bt = getBlockType(type);
 
+    // Block placement animation (easeOutBack scale)
+    let animScale = 1;
+    if (block && now) {
+      const anims = this.state.blockAnimations;
+      for (let i = anims.length - 1; i >= 0; i--) {
+        const anim = anims[i];
+        if (anim.block === block) {
+          const elapsed = now - anim.startTime;
+          if (elapsed < anim.duration) {
+            const t = elapsed / anim.duration;
+            // easeOutBack: overshoot then settle
+            const c1 = 1.70158;
+            const c3 = c1 + 1;
+            animScale = 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
+          } else {
+            anims.splice(i, 1);
+          }
+          break;
+        }
+      }
+    }
+
+    if (animScale !== 1) {
+      ctx.save();
+      ctx.translate(cx, cy - zOff);
+      ctx.scale(animScale, animScale);
+      ctx.translate(-cx, -(cy - zOff));
+    }
+
+    // Dynamic shadow for elevated blocks
+    if (z > 0 && type !== 'coin') {
+      const shadowAlpha = Math.max(0.05, 0.2 - z * 0.03);
+      const shadowOffsetX = z * 2;
+      const shadowOffsetY = z * 1;
+      ctx.globalAlpha = shadowAlpha;
+      ctx.fillStyle = '#000';
+      ctx.beginPath();
+      ctx.ellipse(cx + shadowOffsetX, cy + shadowOffsetY + hh * 0.3, hw * 0.7, hh * 0.4, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
     // Coin: draw as floating diamond instead of block
     if (type === 'coin') {
       this._drawCoin(cx, cy, zOff, now);
@@ -315,6 +370,10 @@ export class Renderer {
     // Type-specific overlays on top face
     if (!isWireframe) {
       this._drawBlockOverlay(ctx, cx, cy, hw, hh, bh, zOff, type, now, block);
+    }
+
+    if (animScale !== 1) {
+      ctx.restore();
     }
   }
 
@@ -461,11 +520,42 @@ export class Renderer {
 
   drawBlocks(now) {
     const rot = this._rotation;
-    const sorted = [...this.state.blocks].sort((a, b) => {
-      const d = getSortDepth(a.gx, a.gy, rot) - getSortDepth(b.gx, b.gy, rot);
-      return d !== 0 ? d : a.z - b.z;
-    });
-    for (const block of sorted) {
+    const state = this.state;
+
+    // Re-sort only when blocks changed or rotation changed
+    const dirtyKey = `${state._blocksDirty}_${rot}`;
+    if (dirtyKey !== this._sortedDirtyKey) {
+      this._sortedBlocks = [...state.blocks].sort((a, b) => {
+        const d = getSortDepth(a.gx, a.gy, rot) - getSortDepth(b.gx, b.gy, rot);
+        return d !== 0 ? d : a.z - b.z;
+      });
+      this._sortedDirtyKey = dirtyKey;
+      state._blocksDirty = false;
+    }
+
+    // Frustum culling: compute visible grid bounds from camera viewport
+    const cam = state.camera;
+    const w = this.canvas.width;
+    const h = this.canvas.height;
+    const dpr = window.devicePixelRatio || 1;
+    const zoom = cam.zoom || 1.0;
+    const corners = [
+      screenToGrid(0, 0, { x: cam.x / zoom, y: cam.y / zoom, rotation: cam.rotation }),
+      screenToGrid(w / dpr / zoom, 0, { x: cam.x / zoom, y: cam.y / zoom, rotation: cam.rotation }),
+      screenToGrid(0, h / dpr / zoom, { x: cam.x / zoom, y: cam.y / zoom, rotation: cam.rotation }),
+      screenToGrid(w / dpr / zoom, h / dpr / zoom, { x: cam.x / zoom, y: cam.y / zoom, rotation: cam.rotation }),
+    ];
+    const margin = 3;
+    const allGx = corners.map(c => c.gx);
+    const allGy = corners.map(c => c.gy);
+    const gxMin = Math.min(...allGx) - margin;
+    const gxMax = Math.max(...allGx) + margin;
+    const gyMin = Math.min(...allGy) - margin;
+    const gyMax = Math.max(...allGy) + margin;
+
+    for (const block of this._sortedBlocks) {
+      // Skip blocks outside visible bounds
+      if (block.gx < gxMin || block.gx > gxMax || block.gy < gyMin || block.gy > gyMax) continue;
       this.drawBlock(block.gx, block.gy, block.z, block.color, block.type || 'normal', now, block);
     }
   }
@@ -592,6 +682,28 @@ export class Renderer {
     }
 
     ctx.setLineDash([]);
+  }
+
+  drawSkidMarks(bike, now) {
+    if (!bike.skidMarks || bike.skidMarks.length === 0) return;
+    const ctx = this.ctx;
+    const cam = this.state.camera;
+
+    for (const mark of bike.skidMarks) {
+      const age = now - mark.time;
+      if (age >= 5000) continue;
+      const opacity = 0.4 * (1 - age / 5000);
+      const s = gridToScreen(mark.gx, mark.gy, this._rotation);
+      const cx = s.x + cam.x;
+      const cy = s.y + cam.y - (mark.z || 0) * BLOCK_HEIGHT;
+
+      ctx.globalAlpha = opacity;
+      ctx.fillStyle = '#333';
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, TILE_WIDTH * 0.15, TILE_HEIGHT * 0.08, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
   }
 
   drawTrail(bike, now) {
@@ -1197,6 +1309,33 @@ export class Renderer {
       ctx.fillText('INVINCIBLE', x + 8, y + statusY);
       statusY += 14;
     }
+
+    // Combo display
+    if (bike.combo > 1) {
+      ctx.fillStyle = '#ff4400';
+      ctx.font = 'bold 14px monospace';
+      ctx.fillText(`COMBO x${bike.combo}!`, x + 8, y + statusY);
+      ctx.font = '12px monospace';
+      statusY += 16;
+    }
+
+    // Lap timer
+    if (bike.currentLapStart > 0) {
+      const currentLap = ((now - bike.currentLapStart) / 1000).toFixed(1);
+      ctx.fillStyle = '#88ff88';
+      ctx.fillText(`Lap: ${currentLap}s`, x + 8, y + statusY);
+      statusY += 14;
+    }
+    if (bike.bestLap < Infinity) {
+      ctx.fillStyle = '#ffdd00';
+      ctx.fillText(`Best: ${bike.bestLap.toFixed(2)}s`, x + 8, y + statusY);
+      statusY += 14;
+    }
+    if (bike.lapTimes.length > 0) {
+      ctx.fillStyle = theme.hudText;
+      ctx.fillText(`Laps: ${bike.lapTimes.length}`, x + 8, y + statusY);
+      statusY += 14;
+    }
   }
 
   _emitBikeParticles(bike, now) {
@@ -1287,64 +1426,60 @@ export class Renderer {
     const ctx = this.ctx;
     const dpr = window.devicePixelRatio || 1;
     const boundary = this.state.worldBoundary || DEFAULT_BOUNDARY;
-    const mapSize = 150;
-    const padding = 10;
-    const x = padding;
-    const y = this.canvas.height / dpr - mapSize - 84; // clear the fixed bottom toolbar
     const rot = this._rotation;
 
-    // Background panel
+    // Size the minimap as ~18% of the viewport's shorter dimension
+    const vpW = this.canvas.width / dpr;
+    const vpH = this.canvas.height / dpr;
+    const mapSize = Math.round(Math.min(vpW, vpH) * 0.18);
+    const pad = Math.round(mapSize * 0.08);
+    const radius = Math.round(mapSize * 0.06);
+
+    // Position: bottom-left, above the toolbar
+    const x = pad;
+    const y = vpH - mapSize - 84;
+
+    // Proportional drawing units
+    const lineW = Math.max(1, mapSize * 0.012);
+    const dotR = Math.max(1, mapSize * 0.012);
+    const bikeR = Math.max(2, mapSize * 0.035);
+
+    // Store bounds for click detection
+    this._minimapBounds = { x, y, size: mapSize };
+
+    // Background
     ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
     ctx.beginPath();
-    ctx.roundRect(x, y, mapSize, mapSize, 4);
+    ctx.roundRect(x, y, mapSize, mapSize, radius);
     ctx.fill();
-
     if (this.theme.hudBorder) {
       ctx.strokeStyle = this.theme.hudBorder;
-      ctx.lineWidth = 1;
+      ctx.lineWidth = lineW;
       ctx.stroke();
     }
 
     // Clip to panel
     ctx.save();
     ctx.beginPath();
-    ctx.roundRect(x, y, mapSize, mapSize, 4);
+    ctx.roundRect(x, y, mapSize, mapSize, radius);
     ctx.clip();
 
-    // Scale: map the full world into mapSize
+    // Scale world into the minimap with some inner margin
+    const margin = mapSize * 0.08;
     const worldIsoW = boundary * 2 * (TILE_WIDTH / 2);
     const worldIsoH = boundary * 2 * (TILE_HEIGHT / 2);
     const maxSpan = Math.max(worldIsoW, worldIsoH);
-    const scale = (mapSize - 10) / maxSpan;
+    const scale = (mapSize - margin * 2) / maxSpan;
 
     const mapCx = x + mapSize / 2;
     const mapCy = y + mapSize / 2;
 
     const toMap = (gx, gy) => {
       const s = gridToScreen(gx, gy, rot);
-      return {
-        x: mapCx + s.x * scale,
-        y: mapCy + s.y * scale,
-      };
+      return { x: mapCx + s.x * scale, y: mapCy + s.y * scale };
     };
 
-    // Warning zone tint
-    const warningDist = 5;
-    const step = Math.max(1, Math.floor(2 / scale));
-    for (let gx = -boundary; gx <= boundary; gx += step) {
-      for (let gy = -boundary; gy <= boundary; gy += step) {
-        const distFromEdge = Math.min(
-          boundary - Math.abs(gx),
-          boundary - Math.abs(gy)
-        );
-        if (distFromEdge >= warningDist) continue;
-        const opacity = (1 - distFromEdge / warningDist) * 0.2;
-        if (opacity <= 0) continue;
-        const mp = toMap(gx, gy);
-        ctx.fillStyle = `rgba(255, 50, 50, ${opacity})`;
-        ctx.fillRect(mp.x - 1, mp.y - 1, 2, 2);
-      }
-    }
+    this._minimapTransform = { mapCx, mapCy, scale, rot };
 
     // Boundary border
     const corners = [
@@ -1354,7 +1489,7 @@ export class Renderer {
       toMap(-boundary, boundary),
     ];
     ctx.strokeStyle = 'rgba(255, 80, 80, 0.6)';
-    ctx.lineWidth = 1;
+    ctx.lineWidth = lineW;
     ctx.beginPath();
     ctx.moveTo(corners[0].x, corners[0].y);
     for (let i = 1; i < corners.length; i++) {
@@ -1367,14 +1502,13 @@ export class Renderer {
     for (const block of this.state.blocks) {
       const mp = toMap(block.gx, block.gy);
       ctx.fillStyle = block.color || '#98a8b8';
-      ctx.fillRect(mp.x - 1, mp.y - 1, 2, 2);
+      ctx.fillRect(mp.x - dotR, mp.y - dotR, dotR * 2, dotR * 2);
     }
 
-    // Trail (only when bike is present)
+    // Trail
     if (bike && bike.trail.length > 0) {
-      const trailColor = bike.trailColor || '#00fff2';
-      ctx.strokeStyle = trailColor;
-      ctx.lineWidth = 1;
+      ctx.strokeStyle = bike.trailColor || '#00fff2';
+      ctx.lineWidth = lineW;
       ctx.globalAlpha = 0.7;
       ctx.beginPath();
       const firstT = toMap(bike.trail[0].gx, bike.trail[0].gy);
@@ -1390,32 +1524,31 @@ export class Renderer {
     // Viewport indicator
     const cam = this.state.camera;
     const zoom = cam.zoom || 1.0;
-    const viewW = (this.canvas.width / dpr) / zoom;
-    const viewH = (this.canvas.height / dpr) / zoom;
-    const camCenterIsoX = (this.canvas.width / dpr / 2 - cam.x) / zoom;
-    const camCenterIsoY = (this.canvas.height / dpr / 2 - cam.y) / zoom;
-
-    const vpLeft = mapCx + (camCenterIsoX - viewW / 2) * scale;
-    const vpTop = mapCy + (camCenterIsoY - viewH / 2) * scale;
-    const vpW = viewW * scale;
-    const vpH = viewH * scale;
-
+    const vW = vpW / zoom;
+    const vH = vpH / zoom;
+    const camCenterIsoX = (vpW / 2 - cam.x) / zoom;
+    const camCenterIsoY = (vpH / 2 - cam.y) / zoom;
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
-    ctx.lineWidth = 1;
-    ctx.strokeRect(vpLeft, vpTop, vpW, vpH);
+    ctx.lineWidth = lineW;
+    ctx.strokeRect(
+      mapCx + (camCenterIsoX - vW / 2) * scale,
+      mapCy + (camCenterIsoY - vH / 2) * scale,
+      vW * scale,
+      vH * scale
+    );
 
-    // Bike dot + direction indicator (only when bike is present)
+    // Bike dot + direction
     if (bike) {
       const bikeMap = toMap(bike.gx, bike.gy);
       ctx.fillStyle = '#fff';
       ctx.beginPath();
-      ctx.arc(bikeMap.x, bikeMap.y, 3, 0, Math.PI * 2);
+      ctx.arc(bikeMap.x, bikeMap.y, bikeR, 0, Math.PI * 2);
       ctx.fill();
 
       const dir = bike.direction;
-      const dirMap = toMap(bike.gx + dir.dgx * 3, bike.gy + dir.dgy * 3);
+      const dirMap = toMap(bike.gx + dir.dgx * 5, bike.gy + dir.dgy * 5);
       ctx.strokeStyle = '#fff';
-      ctx.lineWidth = 1.5;
+      ctx.lineWidth = lineW * 1.5;
       ctx.beginPath();
       ctx.moveTo(bikeMap.x, bikeMap.y);
       ctx.lineTo(dirMap.x, dirMap.y);
@@ -1425,6 +1558,31 @@ export class Renderer {
     ctx.restore();
   }
 
+  handleMinimapClick(clickX, clickY) {
+    const bounds = this._minimapBounds;
+    const transform = this._minimapTransform;
+    if (!bounds || !transform) return false;
+
+    // Check if click is within minimap bounds
+    if (clickX < bounds.x || clickX > bounds.x + bounds.size ||
+        clickY < bounds.y || clickY > bounds.y + bounds.size) {
+      return false;
+    }
+
+    // Convert click position back to iso-space offset from center
+    const isoX = (clickX - transform.mapCx) / transform.scale;
+    const isoY = (clickY - transform.mapCy) / transform.scale;
+
+    // Center the camera on this iso position
+    const dpr = window.devicePixelRatio || 1;
+    const cam = this.state.camera;
+    const zoom = cam.zoom || 1.0;
+    cam.x = (this.canvas.width / dpr / 2) - isoX * zoom;
+    cam.y = (this.canvas.height / dpr / 2) - isoY * zoom;
+
+    return true;
+  }
+
   frame(now) {
     this.fpsTracker.tick();
     const ctx = this.ctx;
@@ -1432,12 +1590,17 @@ export class Renderer {
     const zoom = cam.zoom || 1.0;
     const dpr = window.devicePixelRatio || 1;
 
-    // Animate rotation toward target (ease-out, ~300ms)
+    // Framerate-independent dt
+    const dt = this._lastFrameTime > 0 ? Math.min((now - this._lastFrameTime) / 1000, 0.1) : 1 / 60;
+    this._lastFrameTime = now;
+    const easeFactor = 1 - Math.exp(-6 * dt);
+
+    // Animate rotation toward target (framerate-independent exponential decay)
     const rotDiff = cam.targetRotation - cam.rotation;
     if (Math.abs(rotDiff) < 0.001) {
       cam.rotation = cam.targetRotation;
     } else {
-      cam.rotation += rotDiff * 0.15;
+      cam.rotation += rotDiff * easeFactor;
     }
     this._rotation = cam.rotation;
 
@@ -1449,8 +1612,8 @@ export class Renderer {
       const bikeScreen = gridToScreen(vis.gx, vis.gy, this._rotation);
       const targetX = (this.canvas.width / dpr / 2) - bikeScreen.x * zoom;
       const targetY = (this.canvas.height / dpr / 2) - bikeScreen.y * zoom;
-      cam.x += (targetX - cam.x) * 0.1;
-      cam.y += (targetY - cam.y) * 0.1;
+      cam.x += (targetX - cam.x) * easeFactor;
+      cam.y += (targetY - cam.y) * easeFactor;
     }
 
     // Boost zoom pulse
@@ -1498,6 +1661,8 @@ export class Renderer {
     if (this.bike) {
       const t = now || performance.now();
       this.bike.pruneTrail(t);
+      this.bike.pruneSkidMarks(t);
+      this.drawSkidMarks(this.bike, t);
       this.drawTrail(this.bike, t);
 
       // Energy aura (glow themes, beneath bike)
@@ -1534,11 +1699,9 @@ export class Renderer {
     }
 
     // HUD elements drawn without zoom
-    this.drawFPS();
-    if (this.bike) {
-      this.drawMetrics(this.bike, now);
-    }
-    this.drawMiniMap(this.bike, now);
+    if (this.showFPS) this.drawFPS();
+    if (this.bike && this.showMetrics) this.drawMetrics(this.bike, now);
+    if (this.showMinimap) this.drawMiniMap(this.bike, now);
 
     // Scanlines overlay (retro theme)
     this.drawScanlines();

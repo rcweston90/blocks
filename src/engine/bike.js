@@ -77,8 +77,23 @@ export class BikeState {
     // Afterimage position history (ring buffer, max 6)
     this.posHistory = [];
     this._posHistoryMax = 6;
+
+    // Combo scoring
+    this.combo = 0;
+    this.comboTimer = 0; // timestamp of last coin
+    this.comboWindow = 3000; // ms
+
+    // Lap timer
+    this.lapTimes = [];
+    this.currentLapStart = 0;
+    this.bestLap = Infinity;
+
+    // Skid marks
+    this.skidMarks = []; // {gx, gy, z, time}
   }
 
+  // effectiveSpeed is ms-per-cell (lower = faster).
+  // Boost halves the interval = 2x speed.
   get effectiveSpeed() {
     const base = this.speed;
     const isBoosted = this.boosting || (this.boostUntil > 0 && performance.now() < this.boostUntil);
@@ -136,6 +151,14 @@ export class BikeState {
     this.lean = 0;
     this.wheelPhase = 0;
     this.posHistory = [];
+
+    // Reset combo / lap / skid
+    this.combo = 0;
+    this.comboTimer = 0;
+    this.lapTimes = [];
+    this.currentLapStart = 0;
+    this.bestLap = Infinity;
+    this.skidMarks = [];
     // Preserve: cameraFollow, ghostTrail, invincible, highScore
   }
 
@@ -152,6 +175,8 @@ export class BikeState {
     const cross = this.direction.dgx * d.dgy - this.direction.dgy * d.dgx;
     if (cross !== 0) {
       this.lean = cross > 0 ? 1 : -1;
+      // Add skid mark at current position
+      this.skidMarks.push({ gx: this.gx, gy: this.gy, z: this.z, time: performance.now() });
     }
     this.direction = d;
   }
@@ -222,10 +247,17 @@ export class BikeState {
     return (now - this.startTime - paused) / 1000;
   }
 
-  collect(block, appState) {
+  collect(block, appState, now) {
     if (block.type === 'coin') {
       appState.removeBlock(block);
-      this.score++;
+      // Combo scoring
+      if (now - this.comboTimer < this.comboWindow) {
+        this.combo++;
+      } else {
+        this.combo = 1;
+      }
+      this.comboTimer = now;
+      this.score += this.combo;
     }
   }
 
@@ -368,11 +400,20 @@ export class BikeState {
             return;
           }
 
-          case 'goal':
+          case 'goal': {
             this._moveTo(nextGx, nextGy, now);
-            this.levelComplete = true;
-            appState.statusText = 'LEVEL COMPLETE!';
+            // Lap checkpoint instead of level-complete
+            if (this.currentLapStart > 0) {
+              const lapTime = (now - this.currentLapStart) / 1000;
+              this.lapTimes.push(lapTime);
+              if (lapTime < this.bestLap) this.bestLap = lapTime;
+              appState.statusText = `LAP ${this.lapTimes.length}! ${lapTime.toFixed(2)}s (Best: ${this.bestLap.toFixed(2)}s)`;
+            } else {
+              appState.statusText = 'Lap started!';
+            }
+            this.currentLapStart = now;
             return;
+          }
         }
       }
 
@@ -398,8 +439,9 @@ export class BikeState {
       for (const b of blocksAtDest) {
         const bt = getBlockType(b.type || 'normal');
         if (bt.isCollectible && b.z <= this.z) {
-          this.collect(b, appState);
-          appState.statusText = `Coin! Score: ${this.score}`;
+          this.collect(b, appState, now);
+          const comboText = this.combo > 1 ? ` COMBO x${this.combo}!` : '';
+          appState.statusText = `Coin! Score: ${this.score}${comboText}`;
         }
       }
     }
@@ -412,6 +454,11 @@ export class BikeState {
 
     // Decay lean back to center
     this.lean *= 0.6;
+
+    // Expire combo
+    if (this.combo > 0 && now - this.comboTimer >= this.comboWindow) {
+      this.combo = 0;
+    }
 
     // Apply falling if elevated
     this._applyFalling(appState);
@@ -455,6 +502,19 @@ export class BikeState {
 
   pruneTrail(now) {
     if (this.ghostTrail) return;
-    this.trail = this.trail.filter(t => now - t.time < 10000);
+    // Front-splice: trail is chronologically ordered, remove expired entries from front
+    let cutoff = 0;
+    while (cutoff < this.trail.length && now - this.trail[cutoff].time >= 10000) {
+      cutoff++;
+    }
+    if (cutoff > 0) this.trail.splice(0, cutoff);
+  }
+
+  pruneSkidMarks(now) {
+    let cutoff = 0;
+    while (cutoff < this.skidMarks.length && now - this.skidMarks[cutoff].time >= 5000) {
+      cutoff++;
+    }
+    if (cutoff > 0) this.skidMarks.splice(0, cutoff);
   }
 }

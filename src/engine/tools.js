@@ -275,6 +275,24 @@ export class FillTool {
   }
 }
 
+export class EyedropperTool {
+  constructor() {
+    this.onColorPicked = null; // callback set by GameCanvas
+  }
+  onMouseDown(state, cell) {
+    const topBlock = state.getBlockAt(cell.gx, cell.gy);
+    if (topBlock) {
+      state.activeColor = topBlock.color;
+      if (this.onColorPicked) this.onColorPicked(topBlock.color);
+      state.statusText = `Picked color: ${topBlock.color}`;
+    } else {
+      state.statusText = 'No block to sample';
+    }
+  }
+  onMouseMove() {}
+  onMouseUp() {}
+}
+
 export class ToolManager {
   constructor() {
     this.tools = {
@@ -286,6 +304,7 @@ export class ToolManager {
       moveCamera: new MoveCameraTool(),
       eraser: new EraserTool(),
       fill: new FillTool(),
+      eyedropper: new EyedropperTool(),
     };
   }
 

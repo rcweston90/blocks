@@ -20,6 +20,9 @@ export class AppState {
     this.blockMap = new Map();   // "gx,gy" -> array of blocks
     this.worldBoundary = DEFAULT_BOUNDARY; // ±N cells from origin
     this.activeRampDir = 0; // 0=N, 1=E, 2=S, 3=W
+    this._blocksDirty = true; // dirty flag for cached depth sort
+    this.blockAnimations = []; // {block, startTime, duration}
+    this.clipboard = null; // for copy/paste
   }
 
   _rebuildBlockMap() {
@@ -33,6 +36,15 @@ export class AppState {
       }
       arr.push(b);
     }
+  }
+
+  _removeFromBlockMap(block) {
+    const key = `${block.gx},${block.gy}`;
+    const arr = this.blockMap.get(key);
+    if (!arr) return;
+    const idx = arr.indexOf(block);
+    if (idx !== -1) arr.splice(idx, 1);
+    if (arr.length === 0) this.blockMap.delete(key);
   }
 
   getBlocksAt(gx, gy) {
@@ -70,7 +82,12 @@ export class AppState {
   }
 
   hasBlockAt(gx, gy, z) {
-    return this.blocks.some(b => b.gx === gx && b.gy === gy && b.z === z);
+    const arr = this.blockMap.get(`${gx},${gy}`);
+    if (!arr) return false;
+    for (const b of arr) {
+      if (b.z === z) return true;
+    }
+    return false;
   }
 
   addBlock(gx, gy, z, color, type = 'normal', dir = 0) {
@@ -86,34 +103,38 @@ export class AppState {
         this.blockMap.set(key, arr);
       }
       arr.push(block);
+      this._blocksDirty = true;
+      // Trigger placement animation
+      this.blockAnimations.push({ block, startTime: performance.now(), duration: 200 });
       return true;
     }
     return false;
   }
 
   getMaxZ(gx, gy) {
+    const arr = this.blockMap.get(`${gx},${gy}`);
+    if (!arr) return -1;
     let max = -1;
-    for (const b of this.blocks) {
-      if (b.gx === gx && b.gy === gy && b.z > max) max = b.z;
+    for (const b of arr) {
+      if (b.z > max) max = b.z;
     }
     return max;
   }
 
   getTopmostBlockIndex(gx, gy) {
-    let maxZ = -1;
-    let idx = -1;
-    for (let i = 0; i < this.blocks.length; i++) {
-      const b = this.blocks[i];
-      if (b.gx === gx && b.gy === gy && b.z > maxZ) {
-        maxZ = b.z;
-        idx = i;
-      }
+    const arr = this.blockMap.get(`${gx},${gy}`);
+    if (!arr || arr.length === 0) return -1;
+    let topBlock = arr[0];
+    for (let i = 1; i < arr.length; i++) {
+      if (arr[i].z > topBlock.z) topBlock = arr[i];
     }
-    return idx;
+    return this.blocks.indexOf(topBlock);
   }
 
   deleteBlock(index) {
     if (index >= 0 && index < this.blocks.length) {
+      const block = this.blocks[index];
+      this._removeFromBlockMap(block);
       this.blocks.splice(index, 1);
       if (this.selection && this.selection.type === 'block') {
         if (this.selection.index === index) {
@@ -122,15 +143,16 @@ export class AppState {
           this.selection.index--;
         }
       }
-      this._rebuildBlockMap();
+      this._blocksDirty = true;
     }
   }
 
   removeBlock(block) {
     const idx = this.blocks.indexOf(block);
     if (idx !== -1) {
+      this._removeFromBlockMap(block);
       this.blocks.splice(idx, 1);
-      this._rebuildBlockMap();
+      this._blocksDirty = true;
     }
   }
 
@@ -147,10 +169,18 @@ export class AppState {
     }
   }
 
+  _snapshotBlocks() {
+    return this.blocks.map(b => ({...b}));
+  }
+
+  _snapshotRects() {
+    return this.rectangles.map(r => ({...r}));
+  }
+
   pushUndo() {
     this.undoStack.push({
-      blocks: JSON.parse(JSON.stringify(this.blocks)),
-      rectangles: JSON.parse(JSON.stringify(this.rectangles)),
+      blocks: this._snapshotBlocks(),
+      rectangles: this._snapshotRects(),
     });
     if (this.undoStack.length > 50) this.undoStack.shift();
     this.redoStack = [];
@@ -159,28 +189,30 @@ export class AppState {
   undo() {
     if (this.undoStack.length === 0) return false;
     this.redoStack.push({
-      blocks: JSON.parse(JSON.stringify(this.blocks)),
-      rectangles: JSON.parse(JSON.stringify(this.rectangles)),
+      blocks: this._snapshotBlocks(),
+      rectangles: this._snapshotRects(),
     });
     const snapshot = this.undoStack.pop();
     this.blocks = snapshot.blocks;
     this.rectangles = snapshot.rectangles;
     this.selection = null;
     this._rebuildBlockMap();
+    this._blocksDirty = true;
     return true;
   }
 
   redo() {
     if (this.redoStack.length === 0) return false;
     this.undoStack.push({
-      blocks: JSON.parse(JSON.stringify(this.blocks)),
-      rectangles: JSON.parse(JSON.stringify(this.rectangles)),
+      blocks: this._snapshotBlocks(),
+      rectangles: this._snapshotRects(),
     });
     const snapshot = this.redoStack.pop();
     this.blocks = snapshot.blocks;
     this.rectangles = snapshot.rectangles;
     this.selection = null;
     this._rebuildBlockMap();
+    this._blocksDirty = true;
     return true;
   }
 
@@ -202,6 +234,7 @@ export class AppState {
   removeStartBlocks() {
     this.blocks = this.blocks.filter(b => b.type !== 'start');
     this._rebuildBlockMap();
+    this._blocksDirty = true;
   }
 
   toJSON() {
@@ -231,5 +264,6 @@ export class AppState {
     this.rectangles = data.rectangles || [];
     this.selection = null;
     this._rebuildBlockMap();
+    this._blocksDirty = true;
   }
 }
